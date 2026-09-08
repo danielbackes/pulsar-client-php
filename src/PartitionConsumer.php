@@ -12,10 +12,12 @@ namespace Pulsar;
 
 
 use Pulsar\Exception\IOException;
+use Pulsar\Exception\RuntimeException;
 use Pulsar\IO\AbstractIO;
 use Pulsar\Proto\BaseCommand\Type;
 use Pulsar\Proto\CommandAck;
 use Pulsar\Proto\CommandAck\AckType;
+use Pulsar\Proto\CommandAckResponse;
 use Pulsar\Proto\CommandCloseConsumer;
 use Pulsar\Proto\CommandFlow;
 use Pulsar\Proto\CommandRedeliverUnacknowledgedMessages;
@@ -155,19 +157,51 @@ class PartitionConsumer
 
     /**
      * @param Message $message
-     * @return void
+     * @return CommandAckResponse
      * @throws IOException
+     * @throws RuntimeException
      */
-    public function ack(Message $message)
+    public function ack(Message $message): CommandAckResponse
     {
-        // send CommandAck
+        $requestId = Helper::getRequestID();
+
         $command = new CommandAck();
         $command->setConsumerId($this->id);
         $command->setAckType(AckType::Individual());
         $command->addMessageId($message->getMessageIdData());
         $command->setTxnidLeastBits(null);
         $command->setTxnidMostBits(null);
-        $this->connection->writeCommand(Type::ACK(), $command);
+        $command->setRequestId($requestId);
+
+        $response = $this->connection
+            ->writeCommand(Type::ACK(), $command)
+            ->wait()
+        ;
+
+        $baseCommand = $response->getBaseCommand();
+
+        $commandType = $baseCommand->getType();
+
+        if (Type::CLOSE_CONSUMER_VALUE === $commandType->value()) {
+            throw new RuntimeException(
+                'The consumer was closed before the message acknowledgment was confirmed.'
+            );
+        }
+
+        if (Type::ACK_RESPONSE_VALUE !== $commandType->value()) {
+            throw new RuntimeException(sprintf(
+                'Unexpected Pulsar command type "%d" while waiting for the ACK response.',
+                $commandType->value()
+            ));
+        }
+
+        $ackResponse = $baseCommand->getAckResponse();
+
+        if ($ackResponse->getRequestId() !== $requestId) {
+            throw new RuntimeException('ACK response request ID does not match.');
+        }
+
+        return $ackResponse;
     }
 
 
