@@ -107,10 +107,14 @@ class Packer
         $trackingValue = 0;
         while ($buffer->readableLength()) {
             if ($metadata->hasNumMessagesInBatch()) {
-                list($properties, $payload) = self::readSingleMessage($buffer);
+                /* @var SingleMessageMetadata $singleMetadata */
+                list($singleMetadata, $payload) = self::readSingleMessage($buffer);
+                $properties = $singleMetadata->getPropertiesList();
+                $partitionKey = $singleMetadata->getPartitionKey();
             } else {
                 $payload = self::readMessage($buffer);
                 $properties = $metadata->getPropertiesList();
+                $partitionKey = $metadata->getPartitionKey();
             }
 
             $messages[] = new Message(
@@ -123,7 +127,7 @@ class Packer
                 $batchIdx,
                 $commandMessage->getRedeliveryCount(),
                 $properties,
-                $metadata->getPartitionKey()
+                $partitionKey
             );
             $trackingValue += $batchIdx;
             $batchIdx += 1;
@@ -176,6 +180,6 @@ class Packer
 
         // [payload]
         $payload = $buffer->read($singleMetadata->getPayloadSize());
-        return [$singleMetadata->getPropertiesList(), $payload];
+        return [$singleMetadata, $payload];
     }
 }
