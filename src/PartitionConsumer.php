@@ -157,14 +157,13 @@ class PartitionConsumer
 
     /**
      * @param Message $message
+     * @param int $requestId
      * @return CommandAckResponse
      * @throws IOException
-     * @throws RuntimeException
      */
-    public function ack(Message $message): CommandAckResponse
+    public function ack(Message $message, int $requestId)
     {
-        $requestId = Helper::getRequestID();
-
+        // send CommandAck
         $command = new CommandAck();
         $command->setConsumerId($this->id);
         $command->setAckType(AckType::Individual());
@@ -172,36 +171,7 @@ class PartitionConsumer
         $command->setTxnidLeastBits(null);
         $command->setTxnidMostBits(null);
         $command->setRequestId($requestId);
-
-        $response = $this->connection
-            ->writeCommand(Type::ACK(), $command)
-            ->wait()
-        ;
-
-        $baseCommand = $response->getBaseCommand();
-
-        $commandType = $baseCommand->getType();
-
-        if (Type::CLOSE_CONSUMER_VALUE === $commandType->value()) {
-            throw new RuntimeException(
-                'The consumer was closed before the message acknowledgment was confirmed.'
-            );
-        }
-
-        if (Type::ACK_RESPONSE_VALUE !== $commandType->value()) {
-            throw new RuntimeException(sprintf(
-                'Unexpected Pulsar command type "%d" while waiting for the ACK response.',
-                $commandType->value()
-            ));
-        }
-
-        $ackResponse = $baseCommand->getAckResponse();
-
-        if ($ackResponse->getRequestId() !== $requestId) {
-            throw new RuntimeException('ACK response request ID does not match.');
-        }
-
-        return $ackResponse;
+        $this->connection->writeCommand(Type::ACK(), $command);
     }
 
 

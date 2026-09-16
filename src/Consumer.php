@@ -13,7 +13,11 @@ use Pulsar\Exception\IOException;
 use Pulsar\Exception\MessageNotFound;
 use Pulsar\Exception\OptionsException;
 use Pulsar\Exception\RuntimeException;
+use Pulsar\Proto\BaseCommand\Type;
+use Pulsar\Proto\CommandAckResponse;
 use Pulsar\Proto\CommandMessage;
+use Pulsar\Util\Buffer;
+use Pulsar\Util\Helper;
 use Pulsar\Util\Packer;
 use SplPriorityQueue;
 use SplQueue;
@@ -166,29 +170,11 @@ class Consumer extends Client
             return $this->messageQueue->dequeue();
         }
 
-        try {
-            $response = $this->eventloop->wait($this->getWaitSeconds());
-        } catch (IOException $e) {
-            $response = null;
-
-            $policy = $this->options->getReconnectPolicy();
-            // not enable reconnect
-            if (!$policy['status']) {
-                throw $e;
-            }
-
-            if ($this->reconnect($policy)) {
-                return $this->receive($loop);
-            }
-        }
-
+        $response = $this->pollFrame($this->getWaitSeconds());
 
         // nack
         $this->executeInternalNack();
-
-        // ping
-        $this->ping();
-
+    
         if (is_null($response)) {
             if (!$loop) {
                 throw new MessageNotFound();
@@ -209,27 +195,10 @@ class Consumer extends Client
             return $this->receive($loop);
         }
 
-
-        $consumer = $this->getPartitionConsumer($commandMessage->getConsumerId());
-
-        /**
-         * @var $messages array<Message>
-         */
-        $messages = Packer::decode($commandMessage, $response->getBuffer(), $consumer->getTopic());
-
-        foreach ($messages as $message) {
-
-            // Save Options to Message Object
-            $message->setOptions($this->options);
-
-            $this->messageQueue->enqueue($message);
-        }
-
-        $consumer->decrement(sizeof($messages));
+        $this->enqueueCommandMessage($commandMessage, $response->getBuffer());
 
         return $this->messageQueue->dequeue();
     }
-
 
     /**
      * @return array<Message>
@@ -248,18 +217,83 @@ class Consumer extends Client
     }
 
     /**
+     * Sends the CommandAck and blocks for its CommandAckResponse, correlated by request ID.
+     *
+     * While waiting, any MESSAGE frame that arrives first (the broker may deliver one before
+     * the ACK_RESPONSE, since the connection is asynchronous) is queued rather than discarded.
+     * If the connection is already dead -- or drops while waiting -- sendAckRequest() reconnects
+     * and resends the CommandAck with a fresh request ID on the new connection before (re)waiting.
+     *
      * @param Message $message
-     * @return void
-     * @throws \Exception
+     * @return CommandAckResponse|null
+     * @throws IOException
+     * @throws RuntimeException
      */
-    public function ack(Message $message)
+    public function ack(Message $message): ?CommandAckResponse
     {
         if (!$message->canAck()) {
-            return;
+            return null;
         }
 
-        // send CommandAck
-        $this->getPartitionConsumer($message->getConsumerID())->ack($message);
+        $requestId = $this->sendAckRequest($message);
+
+        $deadline = microtime(true) + $this->options->getAckTimeout();
+
+        do {
+            $remaining = $deadline - microtime(true);
+            if ($remaining <= 0) {
+                throw new RuntimeException('Timed out waiting for ACK response.');
+            }
+
+            // Select::wait() forwards this to stream_select()'s tv_sec, which requires an int
+            $response = $this->pollFrame((int) ceil($remaining), function () use ($message, &$requestId) {
+                // the connection was rebuilt; the outstanding ACK request died with it
+                $requestId = $this->sendAckRequest($message);
+            });
+
+            if (null === $response) {
+                continue;
+            }
+
+            $baseCommand = $response->getBaseCommand();
+
+            $commandType = $baseCommand->getType();
+
+            if (Type::CLOSE_CONSUMER_VALUE === $commandType->value()) {
+                // only abort if it's the consumer this message belongs to; the connection
+                // may be shared with other partition consumers that closed independently
+                if ($baseCommand->getCloseConsumer()->getConsumerId() === $message->getConsumerID()) {
+                    throw new RuntimeException(
+                        'The consumer was closed before the message acknowledgment was confirmed.'
+                    );
+                }
+                continue;
+            }
+
+            if (Type::MESSAGE_VALUE === $commandType->value()) {
+                $this->enqueueCommandMessage($baseCommand->getMessage(), $response->getBuffer());
+                continue;
+            }
+
+            if (Type::ACK_RESPONSE_VALUE === $commandType->value()) {
+                $ackResponse = $baseCommand->getAckResponse();
+
+                if ($ackResponse->getRequestId() !== $requestId) {
+                    throw new RuntimeException('ACK response request ID does not match.');
+                }
+
+                if ($ackResponse->hasError()) {
+                    $msg = $ackResponse->hasMessage() ? $ackResponse->getMessage() : $ackResponse->getError()->name();
+                    throw new RuntimeException(
+                        sprintf('The broker rejected the acknowledgment: %s', $msg),
+                        $ackResponse->getError()->value()
+                    );
+                }
+
+                return $ackResponse;
+            }
+
+        } while (true);
     }
 
 
@@ -356,6 +390,107 @@ class Consumer extends Client
     protected function getPartitionConsumer(int $consumerID): PartitionConsumer
     {
         return $this->consumers[ $consumerID ];
+    }
+
+    /**
+     * Waits for a single frame from the event loop, applying the reconnect policy on
+     * connection loss and running the ping bookkeeping.
+     *
+     * On a dropped connection, once it's rebuilt, $onReconnect (if given) is invoked to
+     * resend whatever the caller had outstanding on the old connection -- a CommandAck,
+     * for instance, has no way to be resumed on a new one. Either way this returns null,
+     * same as a plain timeout, so the caller's own retry loop drives the next poll.
+     *
+     * @param int|float|null $timeoutSeconds
+     * @param callable|null $onReconnect called with no arguments right after a successful reconnect
+     * @return Response|null
+     * @throws IOException
+     */
+    private function pollFrame($timeoutSeconds = null, ?callable $onReconnect = null): ?Response
+    {
+        try {
+            $response = $this->eventloop->wait($timeoutSeconds);
+
+            $this->ping();
+
+            return $response;
+        } catch (IOException $e) {
+            $policy = $this->options->getReconnectPolicy();
+
+            // not enable reconnect
+            if (!$policy['status']) {
+                throw $e;
+            }
+
+            $this->reconnect($policy);
+
+            if ($onReconnect) {
+                $onReconnect();
+            }
+
+            return null;
+        }
+    }
+
+    /**
+     * Sends a CommandAck for $message with a fresh request ID, applying the reconnect policy
+     * (and retrying the send on the rebuilt connection) if the connection is already dead.
+     *
+     * @param Message $message
+     * @return int the request ID the ack was sent with
+     * @throws IOException
+     */
+    private function sendAckRequest(Message $message): int
+    {
+        $requestId = Helper::getRequestID();
+
+        try {
+            $this->getPartitionConsumer($message->getConsumerID())->ack($message, $requestId);
+        } catch (IOException $e) {
+            $policy = $this->options->getReconnectPolicy();
+
+            // not enable reconnect
+            if (!$policy['status']) {
+                throw $e;
+            }
+
+            $this->reconnect($policy);
+
+            return $this->sendAckRequest($message);
+        }
+
+        return $requestId;
+    }
+
+    /**
+     * Decodes a MESSAGE frame's payload into Message objects, queues them locally, and
+     * decrements the partition's available flow-control permits accordingly.
+     *
+     * Shared by receive() and ack()'s wait loop, since a MESSAGE frame can arrive while
+     * ack() is waiting on the same connection for an unrelated ACK_RESPONSE -- it must be
+     * queued here rather than discarded, or the message would be silently lost.
+     *
+     * @param CommandMessage $commandMessage
+     * @param Buffer $buffer
+     * @return void
+     */
+    private function enqueueCommandMessage(CommandMessage $commandMessage, Buffer $buffer)
+    {
+        $consumer = $this->getPartitionConsumer($commandMessage->getConsumerId());
+
+        /**
+         * @var array<Message> $messages
+         */
+        $messages = Packer::decode($commandMessage, $buffer, $consumer->getTopic());
+
+        foreach ($messages as $message) {
+            // Save Options to Message Object
+            $message->setOptions($this->options);
+
+            $this->messageQueue->enqueue($message);
+        }
+
+        $consumer->decrement(sizeof($messages));
     }
 
 }
