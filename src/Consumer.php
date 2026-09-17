@@ -170,10 +170,27 @@ class Consumer extends Client
             return $this->messageQueue->dequeue();
         }
 
-        $response = $this->pollFrame($this->getWaitSeconds());
+        try {
+            $response = $this->eventloop->wait($this->getWaitSeconds());
+        } catch (IOException $e) {
+            $response = null;
+
+            $policy = $this->options->getReconnectPolicy();
+            // not enable reconnect
+            if (!$policy['status']) {
+                throw $e;
+            }
+
+            if ($this->reconnect($policy)) {
+                return $this->receive($loop);
+            }
+        }
 
         // nack
         $this->executeInternalNack();
+
+        // ping
+        $this->ping();
     
         if (is_null($response)) {
             if (!$loop) {
@@ -221,8 +238,15 @@ class Consumer extends Client
      *
      * While waiting, any MESSAGE frame that arrives first (the broker may deliver one before
      * the ACK_RESPONSE, since the connection is asynchronous) is queued rather than discarded.
-     * If the connection is already dead -- or drops while waiting -- sendAckRequest() reconnects
-     * and resends the CommandAck with a fresh request ID on the new connection before (re)waiting.
+     *
+     * Unlike receive(), this does not reconnect on a dropped connection: a lost connection
+     * mid-ack throws IOException immediately, regardless of ConsumerOptions::getReconnectPolicy().
+     *
+     * This is deliberate, not an oversight. A dropped connection during ack() means the
+     * broker may already have decided this consumer is gone and redelivered the message to
+     * another consumer on the same subscription (Shared/Key_Shared). Throwing immediately
+     * gives the caller an honest, timely signal instead of a client library quietly retrying
+     * underneath it.
      *
      * @param Message $message
      * @return CommandAckResponse|null
@@ -235,7 +259,8 @@ class Consumer extends Client
             return null;
         }
 
-        $requestId = $this->sendAckRequest($message);
+        $requestId = Helper::getRequestID();
+        $this->getPartitionConsumer($message->getConsumerID())->ack($message, $requestId);
 
         $deadline = microtime(true) + $this->options->getAckTimeout();
 
@@ -245,11 +270,7 @@ class Consumer extends Client
                 throw new RuntimeException('Timed out waiting for ACK response.');
             }
 
-            // Select::wait() forwards this to stream_select()'s tv_sec, which requires an int
-            $response = $this->pollFrame((int) ceil($remaining), function () use ($message, &$requestId) {
-                // the connection was rebuilt; the outstanding ACK request died with it
-                $requestId = $this->sendAckRequest($message);
-            });
+            $response = $this->eventloop->wait((int) ceil($remaining));
 
             if (null === $response) {
                 continue;
@@ -390,76 +411,6 @@ class Consumer extends Client
     protected function getPartitionConsumer(int $consumerID): PartitionConsumer
     {
         return $this->consumers[ $consumerID ];
-    }
-
-    /**
-     * Waits for a single frame from the event loop, applying the reconnect policy on
-     * connection loss and running the ping bookkeeping.
-     *
-     * On a dropped connection, once it's rebuilt, $onReconnect (if given) is invoked to
-     * resend whatever the caller had outstanding on the old connection -- a CommandAck,
-     * for instance, has no way to be resumed on a new one. Either way this returns null,
-     * same as a plain timeout, so the caller's own retry loop drives the next poll.
-     *
-     * @param int|float|null $timeoutSeconds
-     * @param callable|null $onReconnect called with no arguments right after a successful reconnect
-     * @return Response|null
-     * @throws IOException
-     */
-    private function pollFrame($timeoutSeconds = null, ?callable $onReconnect = null): ?Response
-    {
-        try {
-            $response = $this->eventloop->wait($timeoutSeconds);
-
-            $this->ping();
-
-            return $response;
-        } catch (IOException $e) {
-            $policy = $this->options->getReconnectPolicy();
-
-            // not enable reconnect
-            if (!$policy['status']) {
-                throw $e;
-            }
-
-            $this->reconnect($policy);
-
-            if ($onReconnect) {
-                $onReconnect();
-            }
-
-            return null;
-        }
-    }
-
-    /**
-     * Sends a CommandAck for $message with a fresh request ID, applying the reconnect policy
-     * (and retrying the send on the rebuilt connection) if the connection is already dead.
-     *
-     * @param Message $message
-     * @return int the request ID the ack was sent with
-     * @throws IOException
-     */
-    private function sendAckRequest(Message $message): int
-    {
-        $requestId = Helper::getRequestID();
-
-        try {
-            $this->getPartitionConsumer($message->getConsumerID())->ack($message, $requestId);
-        } catch (IOException $e) {
-            $policy = $this->options->getReconnectPolicy();
-
-            // not enable reconnect
-            if (!$policy['status']) {
-                throw $e;
-            }
-
-            $this->reconnect($policy);
-
-            return $this->sendAckRequest($message);
-        }
-
-        return $requestId;
     }
 
     /**
